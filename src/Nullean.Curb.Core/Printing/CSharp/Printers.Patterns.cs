@@ -10,8 +10,19 @@ internal static partial class Printers
 {
 	public static void IsPatternExpression(IsPatternExpressionSyntax node, PrintContext context)
 	{
+		// A break the author put after `is` is theirs, the same as one between two alternatives of the
+		// pattern that follows. Without this, `x is` / `A or` / `B` kept its `or` breaks and lost the
+		// first one, which reads worse than either preserving all of them or none. One before `is` is
+		// theirs too; it used to join, as `value is null`.
+		var breakBefore = context.AuthorBroke(node.Expression.Span.End, node.IsKeyword.SpanStart);
+		var breakAfter = context.AuthorBroke(node.IsKeyword.Span.End, node.Pattern.SpanStart);
+		var anchor = EnterPatternContinuation(breakBefore || breakAfter, context);
+
 		Node.Print(node.Expression, context);
-		context.Arena.Synthetic(SyntheticText.Space);
+		if (breakBefore)
+			ContinuationLine(node.IsKeyword, anchor, context);
+		else
+			context.Arena.Synthetic(SyntheticText.Space);
 		TokenPrinter.Print(node.IsKeyword, context);
 
 		// A bare recursive pattern (`is { ... }`, no type or positional clause ahead of the brace) that
@@ -19,30 +30,65 @@ internal static partial class Printers
 		// same fits question as whether the property list wraps, so RecursivePattern controls it with a
 		// fits-aware line instead of a fixed space — see BareRecursivePatternOwnsLeadingBrace.
 		if (BareRecursivePatternOwnsLeadingBrace(node.Pattern, context))
-		{
 			Node.Print(node.Pattern, context);
-			return;
+		else
+		{
+			if (breakAfter)
+				BreakBeforePattern(node.Pattern, anchor, context);
+			else
+				context.Arena.Synthetic(SyntheticText.Space);
+
+			Node.Print(node.Pattern, context);
 		}
 
-		// A break the author put after `is` is theirs, the same as one between two alternatives of the
-		// pattern that follows. Without this, `x is` / `A or` / `B` kept its `or` breaks and lost the
-		// first one, which reads worse than either preserving all of them or none.
-		if (context.AuthorBroke(node.IsKeyword.Span.End, node.Pattern.SpanStart))
-			BreakBeforePattern(node.Pattern, context);
-		else
-			context.Arena.Synthetic(SyntheticText.Space);
-
-		Node.Print(node.Pattern, context);
+		ExitPatternContinuation(anchor, context);
 	}
 
 	/// <summary>
-	/// The break an author put ahead of a pattern. A pattern that opens with its own brace has that brace
-	/// placed by this break, so <c>csharp_indent_braces</c> moves it in a level, as BeforeOpenBrace does.
+	/// Claims a register for the continuation lines of a pattern the author broke, and captures in it how
+	/// far the line the pattern starts on moved, as a broken binary chain does. Returns -1 when
+	/// <paramref name="broken"/> is false.
 	/// </summary>
-	private static void BreakBeforePattern(PatternSyntax pattern, PrintContext context)
+	/// <remarks>
+	/// Breaking to the ambient indent put a value after `is`, `or` or `not` at the statement's own column,
+	/// and a subpattern after a broken `(` or `[` one level in, wherever the author had aligned it (issue
+	/// #111). dotnet format moves each continuation line as far as that start line moved.
+	/// </remarks>
+	private static int EnterPatternContinuation(bool broken, PrintContext context)
 	{
-		var opensWithBrace = pattern is RecursivePatternSyntax { Type: null, PositionalPatternClause: null, PropertyPatternClause: not null };
-		using (context.Arena.IndentIf(opensWithBrace && context.Options.IndentBraces))
+		if (!broken)
+			return -1;
+
+		// A case label's pattern measures from the switch, which captured its register already.
+		if (context.CaseLabelContinuation >= 0)
+			return context.CaseLabelContinuation;
+
+		var anchor = context.EnterContinuation();
+		context.Arena.LineShiftAnchor(anchor);
+		return anchor;
+	}
+
+	/// <summary>Releases what <see cref="EnterPatternContinuation"/> claimed, if it claimed anything.</summary>
+	private static void ExitPatternContinuation(int anchor, PrintContext context)
+	{
+		if (anchor >= 0 && anchor != context.CaseLabelContinuation)
+			context.ExitContinuation();
+	}
+
+	/// <summary>
+	/// The break an author put ahead of a pattern, which keeps the offset they gave it. A pattern that
+	/// opens with its own brace has that brace placed by this break instead, so <c>csharp_indent_braces</c>
+	/// moves it in a level, as BeforeOpenBrace does.
+	/// </summary>
+	private static void BreakBeforePattern(PatternSyntax pattern, int anchor, PrintContext context)
+	{
+		if (pattern is not RecursivePatternSyntax { Type: null, PositionalPatternClause: null, PropertyPatternClause: not null })
+		{
+			ContinuationLine(pattern.GetFirstToken(), anchor, context);
+			return;
+		}
+
+		using (context.Arena.IndentIf(context.Options.IndentBraces))
 			context.Arena.HardLine();
 	}
 
@@ -73,20 +119,23 @@ internal static partial class Printers
 	{
 		var arena = context.Arena;
 
+		// A break the author put inside the parentheses is theirs, at the offset they gave it; dotnet
+		// format leaves them all.
+		var positional = node.PositionalPatternClause;
+		var positionalBroken = positional is not null && SpansLines(positional, context);
+		var anchor = EnterPatternContinuation(positionalBroken, context);
+
 		if (node.Type is not null)
 			Node.Print(node.Type, context);
 
-		if (node.PositionalPatternClause is not null)
+		if (positional is not null)
 		{
-			// A break the author put inside the parentheses is theirs; dotnet format leaves them all.
-			var positional = node.PositionalPatternClause;
 			var subpatterns = positional.Subpatterns;
-			var asWritten = SpansLines(positional, context);
 			TokenPrinter.Print(positional.OpenParenToken, context);
 			using (arena.Indent())
 			{
-				if (subpatterns.Count > 0 && asWritten && context.AuthorBroke(positional.OpenParenToken.Span.End, subpatterns[0].SpanStart))
-					arena.HardLine();
+				if (subpatterns.Count > 0 && positionalBroken && context.AuthorBroke(positional.OpenParenToken.Span.End, subpatterns[0].SpanStart))
+					ContinuationLine(subpatterns[0].GetFirstToken(), anchor, context);
 
 				for (var i = 0; i < subpatterns.Count; i++)
 				{
@@ -94,16 +143,17 @@ internal static partial class Printers
 					if (i >= subpatterns.SeparatorCount)
 						continue;
 					TokenPrinter.Print(subpatterns.GetSeparator(i), context);
-					if (asWritten && context.AuthorBroke(subpatterns[i].Span.End, subpatterns[i + 1].SpanStart))
-						arena.HardLine();
+					if (positionalBroken && context.AuthorBroke(subpatterns[i].Span.End, subpatterns[i + 1].SpanStart))
+						ContinuationLine(subpatterns[i + 1].GetFirstToken(), anchor, context);
 					else
 						arena.Synthetic(SyntheticText.Space);
 				}
 			}
 
-			if (subpatterns.Count > 0 && asWritten && context.AuthorBroke(subpatterns[^1].Span.End, positional.CloseParenToken.SpanStart))
-				arena.HardLine();
+			if (subpatterns.Count > 0 && positionalBroken && context.AuthorBroke(subpatterns[^1].Span.End, positional.CloseParenToken.SpanStart))
+				ContinuationLine(positional.CloseParenToken, anchor, context);
 			TokenPrinter.Print(positional.CloseParenToken, context);
+			ExitPatternContinuation(anchor, context);
 		}
 
 		if (node.PropertyPatternClause is not null)
@@ -243,56 +293,71 @@ internal static partial class Printers
 
 	public static void Subpattern(SubpatternSyntax node, PrintContext context)
 	{
-		if (node.ExpressionColon is not null)
+		if (node.ExpressionColon is null)
 		{
-			Node.Print(node.ExpressionColon.Expression, context);
-			TokenPrinter.Print(node.ExpressionColon.ColonToken, context);
-
-			// `Address:` / `{ … }` — a nested pattern the author put on a line of its own stays there.
-			if (context.AuthorBroke(node.ExpressionColon.ColonToken.Span.End, node.Pattern.SpanStart))
-				BreakBeforePattern(node.Pattern, context);
-			else
-				context.Arena.Synthetic(SyntheticText.Space);
+			Node.Print(node.Pattern, context);
+			return;
 		}
 
+		// `Address:` / `{ … }` — a nested pattern the author put on a line of its own stays there.
+		var broken = context.AuthorBroke(node.ExpressionColon.ColonToken.Span.End, node.Pattern.SpanStart);
+		var anchor = EnterPatternContinuation(broken, context);
+		Node.Print(node.ExpressionColon.Expression, context);
+		TokenPrinter.Print(node.ExpressionColon.ColonToken, context);
+
+		if (broken)
+			BreakBeforePattern(node.Pattern, anchor, context);
+		else
+			context.Arena.Synthetic(SyntheticText.Space);
+
 		Node.Print(node.Pattern, context);
+		ExitPatternContinuation(anchor, context);
 	}
 
 	/// <summary>Covers <c>and</c>, <c>or</c> and relational patterns, all of which need spacing.</summary>
 	public static void BinaryPattern(BinaryPatternSyntax node, PrintContext context)
 	{
+		// The same rule BinaryExpression follows: a chain the author broke stays broken, on whichever
+		// side of the operator they broke it, and each continuation line keeps its offset. A long
+		// `is A or B or C` written one alternative per line was closed up onto a single line, because
+		// nothing here asked. That shape is everywhere in analyzer code and was among the largest
+		// sources of churn measured on roslyn.
+		var breakBefore = context.AuthorBroke(node.Left.Span.End, node.OperatorToken.SpanStart);
+		var breakAfter = context.AuthorBroke(node.OperatorToken.Span.End, node.Right.SpanStart);
+		var anchor = EnterPatternContinuation(breakBefore || breakAfter, context);
+
 		Node.Print(node.Left, context);
 
-		// The same rule BinaryExpression follows: a chain the author broke stays broken, on whichever
-		// side of the operator they broke it. A long `is A or B or C` written one alternative per line
-		// was closed up onto a single line, because nothing here asked. That shape is everywhere in
-		// analyzer code and was among the largest sources of churn measured on roslyn.
-		if (context.AuthorBroke(node.Left.Span.End, node.OperatorToken.SpanStart))
-			context.Arena.HardLine(DocFlags.OnlyIfNotAtLineStart);
+		if (breakBefore)
+			ContinuationLine(node.OperatorToken, anchor, context);
 		else
 			context.Arena.Synthetic(SyntheticText.Space);
 
 		TokenPrinter.Print(node.OperatorToken, context);
 
-		if (context.AuthorBroke(node.OperatorToken.Span.End, node.Right.SpanStart))
-			BreakBeforePattern(node.Right, context);
+		if (breakAfter)
+			BreakBeforePattern(node.Right, anchor, context);
 		else
 			context.Arena.Synthetic(SyntheticText.Space);
 
 		Node.Print(node.Right, context);
+		ExitPatternContinuation(anchor, context);
 	}
 
 	public static void UnaryPattern(UnaryPatternSyntax node, PrintContext context)
 	{
+		// `is not` / `{ … }` — a break the author put after `not` is theirs, as one after `is` or `or` is.
+		var broken = context.AuthorBroke(node.OperatorToken.Span.End, node.Pattern.SpanStart);
+		var anchor = EnterPatternContinuation(broken, context);
 		TokenPrinter.Print(node.OperatorToken, context);
 
-		// `is not` / `{ … }` — a break the author put after `not` is theirs, as one after `is` or `or` is.
-		if (context.AuthorBroke(node.OperatorToken.Span.End, node.Pattern.SpanStart))
-			BreakBeforePattern(node.Pattern, context);
+		if (broken)
+			BreakBeforePattern(node.Pattern, anchor, context);
 		else
 			context.Arena.Synthetic(SyntheticText.Space);
 
 		Node.Print(node.Pattern, context);
+		ExitPatternContinuation(anchor, context);
 	}
 
 	public static void RelationalPattern(RelationalPatternSyntax node, PrintContext context)
@@ -305,20 +370,22 @@ internal static partial class Printers
 	public static void ListPattern(ListPatternSyntax node, PrintContext context)
 	{
 		var arena = context.Arena;
+
+		// Printed flat unless the author opened it out, in which case their breaks stay at the offsets
+		// they gave them — the same rule a collection expression follows. The group is what a trailing
+		// comma's IfBreak resolves against.
+		var asWritten = SpansLines(node, context);
+		var anchor = EnterPatternContinuation(asWritten, context);
 		TokenPrinter.Print(node.OpenBracketToken, context);
 
 		var rewritesComma = RewritesTrailingComma(node.Patterns, node.CloseBracketToken, context);
-
-		// Printed flat unless the author opened it out, in which case their breaks stay — the same rule
-		// a collection expression follows. The group is what a trailing comma's IfBreak resolves against.
-		var asWritten = SpansLines(node, context);
 
 		using (arena.Group())
 		{
 			using (arena.Indent())
 			{
 				if (node.Patterns.Count > 0)
-					Edge(node.OpenBracketToken.Span.End, node.Patterns[0].SpanStart);
+					Edge(node.OpenBracketToken.Span.End, node.Patterns[0].GetFirstToken());
 				else
 					Spacing.InsideBrackets(context);
 
@@ -339,7 +406,7 @@ internal static partial class Printers
 						continue;
 
 					if (asWritten && context.AuthorBroke(node.Patterns[i].Span.End, node.Patterns[i + 1].SpanStart))
-						arena.HardLine();
+						ContinuationLine(node.Patterns[i + 1].GetFirstToken(), anchor, context);
 					else
 						Spacing.AfterComma(context);
 				}
@@ -349,12 +416,13 @@ internal static partial class Printers
 			}
 
 			if (node.Patterns.Count > 0)
-				Edge(node.CloseBracketToken.GetPreviousToken().Span.End, node.CloseBracketToken.SpanStart);
+				Edge(node.CloseBracketToken.GetPreviousToken().Span.End, node.CloseBracketToken);
 			else
 				Spacing.InsideBrackets(context);
 		}
 
 		TokenPrinter.Print(node.CloseBracketToken, context);
+		ExitPatternContinuation(anchor, context);
 
 		if (node.Designation is not null)
 		{
@@ -362,10 +430,10 @@ internal static partial class Printers
 			Node.Print(node.Designation, context);
 		}
 
-		void Edge(int from, int to)
+		void Edge(int from, SyntaxToken next)
 		{
-			if (asWritten && context.AuthorBroke(from, to))
-				arena.HardLine();
+			if (asWritten && context.AuthorBroke(from, next.SpanStart))
+				ContinuationLine(next, anchor, context);
 			else
 				Spacing.InsideBrackets(context);
 		}
