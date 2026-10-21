@@ -119,7 +119,7 @@ internal static class TokenPrinter
 
 		// The first token of a continuation line in a broken binary chain: its comments sit at its
 		// column, where dotnet format puts them, rather than at the ambient indent.
-		var aligned = context.TryTakeLeadingTriviaAlignment(token, out var alignRegister, out var alignOffset);
+		var aligned = context.TryTakeLeadingTriviaAlignment(token, out var alignRegister, out var alignOffset, out var alignElement);
 
 		// Blank lines are only preserved *between* things, never introduced at the start of a run,
 		// and never more than one however many the source had.
@@ -219,8 +219,12 @@ internal static class TokenPrinter
 					// The whole run aligns, not only the comment that starts it. Aligning the first
 					// and dropping the rest to the statement indent is neither what dotnet format
 					// writes nor stable: the ragged result read back differently on the next run.
+					//
+					// Not between collection or initializer elements, where dotnet format leaves the
+					// comment on the element's line.
 					var startsAligned = !emittedAnything
 						&& priorNewLines == 0
+						&& !(aligned && alignElement)
 						&& AlignsUnderTrailingComment(trivia, context);
 
 					if (startsAligned || (alignedRun && priorNewLines <= 1))
