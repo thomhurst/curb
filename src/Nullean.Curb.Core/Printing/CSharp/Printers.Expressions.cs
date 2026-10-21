@@ -891,6 +891,20 @@ internal static partial class Printers
 		arena.Synthetic(SyntheticText.Space);
 		TokenPrinter.Print(node.EqualsGreaterThanToken, context);
 
+		// And one the author put below the arrow stays below it, as a lambda's does. The group below never
+		// breaks with no width, so it joined `0 =>` / `[1]`, and a trailing `// note` after the arrow
+		// left the body stranded one column in from the arm.
+		if (context.AuthorBroke(node.EqualsGreaterThanToken.Span.End, node.Expression.SpanStart))
+		{
+			using (arena.Indent())
+			{
+				arena.HardLine(DocFlags.Reindent);
+				Node.Print(node.Expression, context);
+			}
+
+			return;
+		}
+
 		using (arena.Group())
 		using (arena.Indent())
 		{
