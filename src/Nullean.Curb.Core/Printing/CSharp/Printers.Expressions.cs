@@ -151,6 +151,20 @@ internal static partial class Printers
 
 		Node.Print(node.Left, context);
 		Spacing.BeforeOperator(context);
+
+		// A right side the author put below the operator stays there, as EqualsValueClause keeps one
+		// below an initializer's `=` — issue #102.
+		if (!BringsOwnBlock(node.Right) && context.AuthorBroke(node.OperatorToken.Span.End, node.Right.SpanStart))
+		{
+			using (context.Arena.Indent())
+			{
+				TokenPrinter.Print(node.OperatorToken, context);
+				context.Arena.HardLine(DocFlags.OnlyIfNotAtLineStart);
+				Node.Print(node.Right, context);
+			}
+			return;
+		}
+
 		TokenPrinter.Print(node.OperatorToken, context);
 		OperandOnRight(node.Right, context, node.OperatorToken.Span.End);
 	}
@@ -159,7 +173,46 @@ internal static partial class Printers
 	{
 		var arena = context.Arena;
 		var spaced = context.Options.SpaceAroundTernaryOperator;
+
+		// Consumed as BinaryExpression consumes it: an if/while/do/lock condition already sits inside
+		// the indent that opens out its parentheses, so a broken ternary there takes no second level
+		// — issue #109. One deeper in the condition, behind parentheses of its own, needs none either
+		// while it still starts on the `(` line: that indent is already one level in from its line.
+		var alreadyIndented = ReferenceEquals(context.IndentedCondition, node);
+		if (alreadyIndented)
+			context.IndentedCondition = null;
+		else
+			alreadyIndented = StartsOnConditionLine(node, context);
+
 		Node.Print(node.Condition, context);
+
+		// A ternary the author broke keeps exactly their breaks, before or after either operator. The
+		// group below cannot: with no width it never breaks, so it joined them all — issue #102. And
+		// once one break is hard, every Line in the group breaks with it, so the joined positions
+		// need a plain space rather than a Line.
+		//
+		// One that spans lines only inside a branch, such as a block-bodied lambda, keeps its operators
+		// inline and takes no indent: the block anchors to its line, as dotnet format leaves it.
+		if (SpansLines(node, context))
+		{
+			var broken = context.AuthorBroke(node.Condition.Span.End, node.QuestionToken.SpanStart)
+				|| context.AuthorBroke(node.QuestionToken.Span.End, node.WhenTrue.SpanStart)
+				|| context.AuthorBroke(node.WhenTrue.Span.End, node.ColonToken.SpanStart)
+				|| context.AuthorBroke(node.ColonToken.Span.End, node.WhenFalse.SpanStart);
+
+			using (arena.IndentIf(broken && !alreadyIndented))
+			{
+				AuthorTernaryBreak(node.Condition.Span.End, node.QuestionToken.SpanStart, spaced, context);
+				TokenPrinter.Print(node.QuestionToken, context);
+				AuthorTernaryBreak(node.QuestionToken.Span.End, node.WhenTrue.SpanStart, spaced, context);
+				Node.Print(node.WhenTrue, context);
+				AuthorTernaryBreak(node.WhenTrue.Span.End, node.ColonToken.SpanStart, spaced, context);
+				TokenPrinter.Print(node.ColonToken, context);
+				AuthorTernaryBreak(node.ColonToken.Span.End, node.WhenFalse.SpanStart, spaced, context);
+				Node.Print(node.WhenFalse, context);
+			}
+			return;
+		}
 
 		using (arena.Group())
 		using (arena.Indent())
@@ -184,6 +237,36 @@ internal static partial class Printers
 				arena.Synthetic(SyntheticText.Space);
 			Node.Print(node.WhenFalse, context);
 		}
+	}
+
+	/// <summary>
+	/// True for an operand of an if/while/do/lock condition, reached only through parentheses, operators
+	/// and <c>!</c>, that starts on the line of the condition's <c>(</c>.
+	/// </summary>
+	private static bool StartsOnConditionLine(ExpressionSyntax node, PrintContext context)
+	{
+		SyntaxNode current = node;
+		while (current.Parent is ParenthesizedExpressionSyntax or BinaryExpressionSyntax or PrefixUnaryExpressionSyntax)
+			current = current.Parent;
+
+		var openParen = current.Parent switch
+		{
+			IfStatementSyntax statement when statement.Condition == current => statement.OpenParenToken,
+			WhileStatementSyntax statement when statement.Condition == current => statement.OpenParenToken,
+			DoStatementSyntax statement when statement.Condition == current => statement.OpenParenToken,
+			LockStatementSyntax statement when statement.Expression == current => statement.OpenParenToken,
+			_ => default,
+		};
+
+		return openParen.RawKind != 0 && context.AuthorJoined(openParen.Span.End, node.SpanStart);
+	}
+
+	private static void AuthorTernaryBreak(int from, int to, bool spaced, PrintContext context)
+	{
+		if (context.AuthorBroke(from, to))
+			context.Arena.HardLine(DocFlags.OnlyIfNotAtLineStart);
+		else if (spaced)
+			context.Arena.Synthetic(SyntheticText.Space);
 	}
 
 	/// <summary>Operators csharp_space_after_unary_operator does not reach even when on — measured
@@ -639,6 +722,15 @@ internal static partial class Printers
 			return;
 		}
 
+		// A body the author started on the arrow's line stays there, as an expression-bodied member's
+		// does — the group below broke as soon as the body kept a break of its own, so `x => x.Flag` /
+		// `? a` / `: b` gained a break after the arrow (issue #102).
+		if (expression is not null && context.AuthorJoined(arrow.Span.End, expression.SpanStart))
+		{
+			BodyOnArrowLine(expression, context);
+			return;
+		}
+
 		// An expression body that itself ends with a block-bodied callback — `builder =>
 		// builder.Add(x => { … })` — already positions its own contents once that block opens.
 		// Wrapping it in a breakable group as well would let the block's hardline propagate outward
@@ -671,6 +763,22 @@ internal static partial class Printers
 			arena.Line();
 			Node.Print(expression, context);
 		}
+	}
+
+	/// <summary>Prints an arrow's body on the arrow's own line, where the author started it.</summary>
+	/// <remarks>
+	/// Only a body whose continuation lines would otherwise sit at the arrow's own level takes an indent
+	/// here. A call, a member chain, a ternary or a construct with braces of its own already positions
+	/// its continuation one level in from the line it starts on, and indenting it again put
+	/// `=> Call(` / `1)` two levels in, where dotnet format leaves it at one.
+	/// </remarks>
+	private static void BodyOnArrowLine(ExpressionSyntax body, PrintContext context)
+	{
+		var hangs = body is BinaryExpressionSyntax || !(BringsOwnBlock(body) || BreaksWithoutHelp(body));
+
+		context.Arena.Synthetic(SyntheticText.Space);
+		using (context.Arena.IndentIf(hangs))
+			Node.Print(body, context);
 	}
 
 	/// <summary>The <c>delegate (T x) { }</c> form that predates lambdas.</summary>
@@ -890,6 +998,13 @@ internal static partial class Printers
 
 		arena.Synthetic(SyntheticText.Space);
 		TokenPrinter.Print(node.EqualsGreaterThanToken, context);
+
+		// Same as a lambda's body: one the author started on the arrow's line stays there.
+		if (context.AuthorJoined(node.EqualsGreaterThanToken.Span.End, node.Expression.SpanStart))
+		{
+			BodyOnArrowLine(node.Expression, context);
+			return;
+		}
 
 		// And one the author put below the arrow stays below it, as a lambda's does. The group below never
 		// breaks with no width, so it joined `0 =>` / `[1]`, and a trailing `// note` after the arrow
